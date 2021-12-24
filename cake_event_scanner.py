@@ -4,7 +4,8 @@ import logging
 import time
 import pymysql
 import pandas as pd
-import tqdm as tqdm
+
+from tqdm import tqdm
 from web3 import HTTPProvider, Web3
 
 from web3.datastructures import AttributeDict
@@ -22,46 +23,45 @@ class CakeEventScanner(EventScannerState):
         self.last_block = 0
         self.last_save = 0
         self.pair = pair
-        self.swap_events = pd.DataFrame.empty
-        self.deposit_events = pd.DataFrame.empty
+        self.swap_events = pd.DataFrame()
+        self.deposit_events = pd.DataFrame()
         self.connection = pymysql.connect(host='localhost',
                                           user='root',
                                           password='root',
                                           database='kk',
                                           cursorclass=pymysql.cursors.DictCursor)
-        self.sql_engine = create_engine('mysql+pymysql://root:root@locahost/kk')
+        self.sql_engine = create_engine('mysql+pymysql://root:root@localhost/kk')
 
     def reset(self):
-        with self.connection:
-            with self.connection.cursor() as cursor:
-                query = "insert into last_block_scan (address,block) values (%s,0)"
-                cursor.execute(query, self.pair.address)
-            self.connection.commit()
+        with self.connection.cursor() as cursor:
+            query = "insert into last_block_scan (address,block) values (%s,0)"
+            cursor.execute(query, self.pair.address)
+        self.connection.commit()
 
     def restore(self):
-        with self.connection:
-            with self.connection.cursor() as cursor:
-                query = "select block from last_block_scan where address=%s"
-                cursor.execute(query, self.pair.address)
-                ret = cursor.fetchone()
-                if ret is not None:
-                    self.last_block = ret['block']
+        with self.connection.cursor() as cursor:
+            query = "select block from last_block_scan where address=%s"
+            cursor.execute(query, self.pair.address)
+            ret = cursor.fetchone()
+            if ret is not None:
+                self.last_block = ret['block']
 
     def save(self):
         with self.sql_engine.connect() as connection:
-            deposit_table = f"dex_{self.pair.dex}_{self.pair.name}_deposit_data"
-            self.deposit_events.to_sql(deposit_table, connection, if_exists='append')
-            self.deposit_events = self.deposit_events.iloc[0:0]
+            if len(self.deposit_events.index) > 0:
+                deposit_table = f"dex_{self.pair.dex}_{self.pair.name}_deposit_data"
+                self.deposit_events.to_sql(deposit_table, connection, if_exists='append')
+                self.deposit_events = self.deposit_events.iloc[0:0]
 
-            swap_table = f"dex_{self.pair.dex}_{self.pair.name}_swap_data"
-            self.swap_events.to_sql(swap_table, connection, if_exists='append')
-            self.swap_events = self.swap_events.iloc[0:0]
+            if len(self.swap_events.index) > 0:
+                swap_table = f"dex_{self.pair.dex}_{self.pair.name}_swap_data"
+                self.swap_events.to_sql(swap_table, connection, if_exists='append')
+                self.swap_events = self.swap_events.iloc[0:0]
 
-        with self.connection:
-            with self.connection.cursor() as cursor:
-                query = "update last_block_scan set block=%s where address=%s"
-                cursor.execute(query, (self.last_block, self.pair.address))
-            self.connection.commit()
+        with self.connection.cursor() as cursor:
+            query = "insert into last_block_scan (address,block) values (%s,0) on duplicate key update block=%s"
+            cursor.execute(query, (self.pair.address, self.last_block))
+        self.connection.commit()
         self.last_save = time.time()
 
     def get_last_scanned_block(self) -> int:
@@ -72,7 +72,8 @@ class CakeEventScanner(EventScannerState):
 
     def end_chunk(self, block_number: int):
         self.last_block = block_number
-        if time.time() - self.last_save > 60:
+        current_time = time.time()
+        if current_time - self.last_save > 60:
             self.save()
 
     def process_event(self, block_when: datetime.datetime, event: AttributeDict) -> object:
@@ -93,23 +94,30 @@ class CakeEventScanner(EventScannerState):
         event_name = event["event"].lower()
         if event_name == 'mint' or event_name == 'burn':
             event = {
+                "type": event_name,
                 "block": block_number,
                 "tnx_hash": tnx_hash,
                 "log_index": log_index,
-                "amount0": args["amount0"],
-                "amount1": args["amount1"],
-                "sender": args["sender"],
+                "amount0": str(args["amount0"]),
+                "amount1": str(args["amount1"]),
+                "sender": str(args["sender"]),
                 "timestamp": block_when.isoformat(),
             }
-            self.deposit_events.append(event)
+            self.deposit_events = self.deposit_events.append(event, ignore_index=True)
         elif event_name == 'swap':
             event = {
                 "block": block_number,
                 "tnx_hash": tnx_hash,
                 "log_index": log_index,
+                "sender": args["sender"],
+                "to": args["to"],
+                "amount0In": str(args["amount0In"]),
+                "amount0Out": str(args["amount0Out"]),
+                "amount1In": str(args["amount1In"]),
+                "amount1Out": str(args["amount1Out"]),
                 "timestamp": block_when.isoformat(),
             }
-            self.swap_events.append(event)
+            self.swap_events = self.swap_events.append(event, ignore_index=True)
 
         # Return a pointer that allows us to look up this event later if needed
         return f"{block_number}-{tnx_hash}-{log_index}"
@@ -152,7 +160,7 @@ if __name__ == '__main__':
         web3=web3,
         contract=contract,
         state=state,
-        events=[contract.events.Swap],
+        events=[contract.events.Mint, contract.events.Burn, contract.events.Swap],
         filters={"address": web3.toChecksumAddress(ada_busd_pair.address)},
         # How many maximum blocks at the time we request from JSON-RPC
         # and we are unlikely to exceed the response size limit of the JSON-RPC server
