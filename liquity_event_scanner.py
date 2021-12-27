@@ -1,31 +1,28 @@
 import datetime
 import json
 import logging
-import sys
 import time
-import pymysql
-import pandas as pd
 
+import pandas as pd
+import pymysql
+from sqlalchemy import create_engine
 from tqdm import tqdm
 from web3 import HTTPProvider, Web3
-
 from web3.datastructures import AttributeDict
 from web3.middleware import geth_poa_middleware
 
 from event_scanner import EventScanner
 from event_scanner_state import EventScannerState
 from pair import Pair
-from sqlalchemy import create_engine
 
 
-class UniEventScanner(EventScannerState):
+class LiquityEventScanner(EventScannerState):
 
-    def __init__(self, pair: Pair):
+    def __init__(self, pair: Pair, event_prefix: int = 0):
         self.last_block = 0
         self.last_save = 0
         self.pair = pair
-        self.swap_events = pd.DataFrame()
-        self.deposit_events = pd.DataFrame()
+        self.trove_update_events = pd.DataFrame()
         self.connection = pymysql.connect(host='localhost',
                                           user='root',
                                           password='root',
@@ -49,15 +46,10 @@ class UniEventScanner(EventScannerState):
 
     def save(self):
         with self.sql_engine.connect() as connection:
-            if len(self.deposit_events.index) > 0:
-                deposit_table = f"dex_{self.pair.dex}_{self.pair.name}_deposit_data"
-                self.deposit_events.to_sql(deposit_table, connection, if_exists='append')
-                self.deposit_events = self.deposit_events.iloc[0:0]
-
-            if len(self.swap_events.index) > 0:
-                swap_table = f"dex_{self.pair.dex}_{self.pair.name}_swap_data"
-                self.swap_events.to_sql(swap_table, connection, if_exists='append')
-                self.swap_events = self.swap_events.iloc[0:0]
+            if len(self.trove_update_events.index) > 0:
+                deposit_table = f"dex_liquity_trove_updated_event"
+                self.trove_update_events.to_sql(deposit_table, connection, if_exists='append')
+                self.trove_update_events = self.trove_update_events.iloc[0:0]
 
         with self.connection.cursor() as cursor:
             query = "insert into last_block_scan (address,block) values (%s,0) on duplicate key update block=%s"
@@ -92,54 +84,21 @@ class UniEventScanner(EventScannerState):
 
         # Convert ERC-20 Transfer event to our internal format
         args = event["args"]
-        event_name = event["event"].lower()
-        toke0_name = self.pair.name.split('_')[0].upper()
-        toke1_name = self.pair.name.split('_')[1].upper()
-        if event_name == 'mint' or event_name == 'burn':
-            event = {
-                "type": event_name,
-                "block": block_number,
-                "tnx_hash": tnx_hash,
-                "log_index": log_index,
-                "amount_0": str(args["amount0"]),
-                "amount_1": str(args["amount1"]),
-                "token_0": toke0_name,
-                "token_1": toke1_name,
-                "amount": str(args["amount"]),
-                "owner": str(args["owner"]),
-                "tick_lower": str(args["tickLower"]),
-                "tick_upper": str(args["tickUpper"]),
-                "timestamp": block_when.isoformat(),
-            }
-            if hasattr(args, 'sender'):
-                event["sender"] = str(args["sender"]),
-            self.deposit_events = self.deposit_events.append(event, ignore_index=True)
-        elif event_name == 'swap':
-            if args["amount0"] > 0:
-                value_traded_in = str(args["amount0"])
-                token_traded_in = toke0_name
-                value_trade_out = str(-1 * args["amount1"])
-                token_traded_out = toke1_name
-            else:
-                value_traded_in = str(args["amount1"])
-                token_traded_in = toke1_name
-                value_trade_out = str(-1 * args["amount0"])
-                token_traded_out = toke0_name
+        event_name = event["event"]
+        if event_name == 'TroveUpdated':
             event = {
                 "block": block_number,
                 "tnx_hash": tnx_hash,
                 "log_index": log_index,
-                "sender": args["sender"],
-                "to": args["recipient"],
-                "value_traded_in": value_traded_in,
-                "token_traded_in": token_traded_in,
-                "value_trade_out": value_trade_out,
-                "token_traded_out": token_traded_out,
-                "liquidity": str(args["liquidity"]),
-                "tick": str(args["tick"]),
-                "timestamp": block_when.isoformat(),
+                "borrower": args["_borrower"],
+                "debt": args["_debt"],
+                "collateral": args["_coll"],
+                "stake": args["_stake"],
+                "operation": args["_operation"],
+                "contract": self.pair.address,
+                "contract_name": self.pair.name,
             }
-            self.swap_events = self.swap_events.append(event, ignore_index=True)
+            self.trove_update_events = self.trove_update_events.append(event, ignore_index=True)
 
         # Return a pointer that allows us to look up this event later if needed
         return f"{block_number}-{tnx_hash}-{log_index}"
@@ -149,10 +108,6 @@ class UniEventScanner(EventScannerState):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        print("Usage: uni_event_scanner.py token0Name_token1Name pair_address")
-        sys.exit(1)
-
     api_url = 'https://eth-mainnet.alchemyapi.io/v2/LO7hoYZP-ekHltipWjayoHmneEV9pgGp'
 
     # Enable logs to the stdout.
@@ -171,14 +126,13 @@ if __name__ == '__main__':
         web3.middleware_onion.inject(geth_poa_middleware, layer=0)
 
     # Prepare stub ERC-20 contract object
-    with open('abi/uni_pair.json') as f:
+    with open('abi/liquity_event.json') as f:
         abi = json.load(f)
     contract = web3.eth.contract(abi=abi)
 
-    # Restore/create our persistent state
-    pair = Pair(sys.argv[1], sys.argv[2], 'uniswap')
+    contract_address = Pair("TroveManager", '0xa39739ef8b0231dbfa0dcda07d7e29faabcf4bb2', 'liquity')
 
-    state = UniEventScanner(pair)
+    state = LiquityEventScanner(contract_address)
     state.restore()
 
     # chain_id: int, web3: Web3, abi: dict, state: EventScannerState, events: List, filters: {}, max_chunk_scan_size: int=10000
@@ -186,8 +140,8 @@ if __name__ == '__main__':
         web3=web3,
         contract=contract,
         state=state,
-        events=[contract.events.Mint, contract.events.Burn, contract.events.Swap],
-        filters={"address": web3.toChecksumAddress(pair.address)},
+        events=[contract.events.TroveUpdated],
+        filters={"address": web3.toChecksumAddress(contract_address.address)},
         # How many maximum blocks at the time we request from JSON-RPC
         # and we are unlikely to exceed the response size limit of the JSON-RPC server
         max_chunk_scan_size=5000

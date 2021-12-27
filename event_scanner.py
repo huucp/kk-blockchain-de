@@ -308,7 +308,7 @@ def _fetch_events_for_all_contracts(
         # More information how processLog works here
         # https://github.com/ethereum/web3.py/blob/fbaf1ad11b0c7fac09ba34baff2c256cffe0a148/web3/_utils/events.py#L200
         evt = get_event_data(codec, abi, log)
-        print(evt)
+        # print(evt)
         # Note: This was originally yield,
         # but deferring the timeout exception caused the throttle logic not to work
         all_events.append(evt)

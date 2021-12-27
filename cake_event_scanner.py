@@ -1,6 +1,7 @@
 import datetime
 import json
 import logging
+import sys
 import time
 import pymysql
 import pandas as pd
@@ -82,7 +83,7 @@ class CakeEventScanner(EventScannerState):
         # One transaction may contain multiple events
         # and each one of those gets their own log index
 
-        print(event)
+        # print(event)
 
         log_index = event.logIndex  # Log index within the block
         # transaction_index = event.transactionIndex  # Transaction index within the block
@@ -92,29 +93,43 @@ class CakeEventScanner(EventScannerState):
         # Convert ERC-20 Transfer event to our internal format
         args = event["args"]
         event_name = event["event"].lower()
+        toke0_name = self.pair.name.split('_')[0].upper()
+        toke1_name = self.pair.name.split('_')[1].upper()
         if event_name == 'mint' or event_name == 'burn':
             event = {
                 "type": event_name,
                 "block": block_number,
                 "tnx_hash": tnx_hash,
                 "log_index": log_index,
-                "amount0": str(args["amount0"]),
-                "amount1": str(args["amount1"]),
+                "amount_0": str(args["amount0"]),
+                "amount_1": str(args["amount1"]),
+                "token_0": toke0_name,
+                "token_1": toke1_name,
                 "sender": str(args["sender"]),
                 "timestamp": block_when.isoformat(),
             }
             self.deposit_events = self.deposit_events.append(event, ignore_index=True)
         elif event_name == 'swap':
+            if args["amount0In"] > 0:
+                value_traded_in = str(args["amount0In"])
+                token_traded_in = toke0_name
+                value_trade_out = str(args["amount1Out"])
+                token_traded_out = toke1_name
+            else:
+                value_traded_in = str(args["amount1In"])
+                token_traded_in = toke1_name
+                value_trade_out = str(args["amount0Out"])
+                token_traded_out = toke0_name
             event = {
                 "block": block_number,
                 "tnx_hash": tnx_hash,
                 "log_index": log_index,
                 "sender": args["sender"],
                 "to": args["to"],
-                "amount0In": str(args["amount0In"]),
-                "amount0Out": str(args["amount0Out"]),
-                "amount1In": str(args["amount1In"]),
-                "amount1Out": str(args["amount1Out"]),
+                "value_traded_in": value_traded_in,
+                "token_traded_in": token_traded_in,
+                "value_trade_out": value_trade_out,
+                "token_traded_out": token_traded_out,
                 "timestamp": block_when.isoformat(),
             }
             self.swap_events = self.swap_events.append(event, ignore_index=True)
@@ -127,6 +142,10 @@ class CakeEventScanner(EventScannerState):
 
 
 if __name__ == '__main__':
+    if len(sys.argv) < 3:
+        print("Usage: cake_event_scanner.py token0Name_token1Name pair_address")
+        sys.exit(1)
+
     api_url = 'https://bsc-dataseed1.binance.org:443'
 
     # Enable logs to the stdout.
@@ -150,9 +169,9 @@ if __name__ == '__main__':
     contract = web3.eth.contract(abi=abi)
 
     # Restore/create our persistent state
-    ada_busd_pair = Pair("ada_busd", '0x1E249DF2F58cBef7EAc2b0EE35964ED8311D5623', 'pancake')
+    pair = Pair(sys.argv[1], sys.argv[2], 'uniswap')
 
-    state = CakeEventScanner(ada_busd_pair)
+    state = CakeEventScanner(pair)
     state.restore()
 
     # chain_id: int, web3: Web3, abi: dict, state: EventScannerState, events: List, filters: {}, max_chunk_scan_size: int=10000
@@ -161,7 +180,7 @@ if __name__ == '__main__':
         contract=contract,
         state=state,
         events=[contract.events.Mint, contract.events.Burn, contract.events.Swap],
-        filters={"address": web3.toChecksumAddress(ada_busd_pair.address)},
+        filters={"address": web3.toChecksumAddress(pair.address)},
         # How many maximum blocks at the time we request from JSON-RPC
         # and we are unlikely to exceed the response size limit of the JSON-RPC server
         max_chunk_scan_size=5000
